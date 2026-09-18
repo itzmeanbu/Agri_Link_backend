@@ -83,6 +83,13 @@ app.post('/api/auth/register', async (req, res) => {
     let { name, email, password, phone = '', region = '', role } = req.body;
     if (!name || !email || !password || password.length < 6 || !['farmer', 'fpo', 'buyer'].includes(role))
       return res.status(400).json({ error: 'Name, valid role, email and a 6+ character password are required' });
+    email = String(email).trim().toLowerCase();
+    // An account that the admin deleted lives on as a soft-deleted row, and the
+    // unique email index used to block the same person from signing up again.
+    // Free the address by removing the deleted row before creating the new one.
+    let existing = await User.findOne({ email });
+    if (existing && existing.deletedAt) await User.deleteOne({ _id: existing._id });
+    else if (existing) return res.status(409).json({ error: 'Email already registered' });
     let u = await User.create({ name, email, phone, region, password: await bcrypt.hash(password, 12), role });
     res.status(201).json({ message: 'Registration submitted for admin approval', user: clean(u) })
   } catch (e) { res.status(e.code === 11000 ? 409 : 400).json({ error: e.code === 11000 ? 'Email already registered' : 'Registration failed' }) }
@@ -119,7 +126,14 @@ app.post('/api/lots', auth, allow('farmer', 'fpo'), async (q, s) => s.status(201
 app.patch('/api/lots/:id', auth, async (q, s) => s.json(await changed(Lot, q.params.id, q.body)));
 app.delete('/api/lots/:id', auth, admin, async (q, s) => { let l = await changed(Lot, q.params.id, { deletedAt: new Date() }); l ? s.json({ message: 'Removed' }) : s.status(404).json({ error: 'Lot not found' }) });
 
-app.get('/api/offers', auth, async (q, s) => s.json(await Offer.find(q.user.role === 'buyer' ? { buyerId: q.user.id, deletedAt: null } : { deletedAt: null }).sort({ createdAt: -1 })));
+// Offers are private to the two sides of the deal: the buyer who made the
+// offer and the seller (farmer or FPO) who owns the lot. Admins see everything.
+app.get('/api/offers', auth, async (q, s) => {
+  if (q.user.role === 'admin') return s.json(await Offer.find({ deletedAt: null }).sort({ createdAt: -1 }));
+  if (q.user.role === 'buyer') return s.json(await Offer.find({ buyerId: q.user.id, deletedAt: null }).sort({ createdAt: -1 }));
+  let myLotIds = (await Lot.find({ ownerId: q.user.id }).select('_id')).map(l => l._id);
+  s.json(await Offer.find({ lotId: { $in: myLotIds }, deletedAt: null }).sort({ createdAt: -1 }))
+});
 app.post('/api/offers', auth, allow('buyer'), async (q, s) => s.status(201).json(await Offer.create({ ...q.body, buyerId: q.user.id, ownerId: q.user.id })));
 app.patch('/api/offers/:id', auth, async (q, s) => {
   let offer = await Offer.findOne({ _id: q.params.id, deletedAt: null });
@@ -150,6 +164,9 @@ app.patch('/api/orders/:id', auth, async (q, s) => {
   }
   s.json(updated)
 });
+// Admin can move an offer or an order to the recycle bin, just like lots and tools.
+app.delete('/api/offers/:id', auth, admin, async (q, s) => { let o = await changed(Offer, q.params.id, { deletedAt: new Date() }); o ? s.json({ message: 'Removed' }) : s.status(404).json({ error: 'Offer not found' }) });
+app.delete('/api/orders/:id', auth, admin, async (q, s) => { let o = await changed(Order, q.params.id, { deletedAt: new Date() }); o ? s.json({ message: 'Removed' }) : s.status(404).json({ error: 'Order not found' }) });
 
 // Equipment / tool rental — read is open to any signed-in user (farmers and
 // FPOs browse), but only admins may create, edit, or remove listings: this
@@ -161,8 +178,19 @@ app.patch('/api/equipment/:id', auth, admin, async (q, s) => s.json(await change
 app.delete('/api/equipment/:id', auth, admin, async (q, s) => { let e = await changed(Equipment, q.params.id, { deletedAt: new Date() }); e ? s.json({ message: 'Removed' }) : s.status(404).json({ error: 'Equipment not found' }) });
 
 const resource = { schemes: Generic.Scheme, grievances: Generic.Grievance, requirements: Generic.Requirement, 'market-prices': Generic.MarketPrice, payments: Order };
+// Schemes and market prices are shared reference data, so everyone sees the
+// whole list. Grievances, requirements and payments belong to one account, so
+// a signed-in user only sees their own (admins still see everything).
+const sharedLists = ['schemes', 'market-prices'];
 for (const [path, Model] of Object.entries(resource)) {
-  app.get('/api/' + path, auth, async (q, s) => s.json(await Model.find({ deletedAt: null }).sort({ createdAt: -1 })));
+  app.get('/api/' + path, auth, async (q, s) => {
+    let scope = { deletedAt: null };
+    if (q.user.role !== 'admin' && !sharedLists.includes(path))
+      scope = path === 'payments'
+        ? { deletedAt: null, $or: [{ farmerId: q.user.id }, { buyerId: q.user.id }] }
+        : { deletedAt: null, ownerId: q.user.id };
+    s.json(await Model.find(scope).sort({ createdAt: -1 }))
+  });
   app.post('/api/' + path, auth, async (q, s) => s.status(201).json(await Model.create({ ...q.body, ownerId: q.user.id })));
   app.patch('/api/' + path + '/:id', auth, async (q, s) => s.json(await changed(Model, q.params.id, q.body)))
 }
@@ -200,6 +228,37 @@ app.patch('/api/admin/recycle/:type/:id/restore', auth, admin, async (q, s) => {
   restored ? s.json({ message: 'Record restored', type: q.params.type, record: clean(restored) }) : s.status(404).json({ error: 'Deleted record not found' })
 });
 
+// ---- Permanent clear-out ("Empty bin") -------------------------------------
+// These routes erase records for good. Everything else in the app only ever
+// soft-deletes, so this is the single place where data really leaves the DB.
+const recycleModels = () => ({ User, Lot, Offer, Order, Equipment, ...Object.fromEntries(Object.entries(Generic).map(([name, model]) => [model.modelName, model])) });
+
+// Erase one record permanently.
+app.delete('/api/admin/recycle/:type/:id', auth, admin, async (q, s) => {
+  let Model = recycleModels()[q.params.type];
+  if (!Model) return s.status(400).json({ error: 'Unknown recycle-bin record type' });
+  let gone = await Model.findOneAndDelete({ _id: q.params.id, deletedAt: { $ne: null } });
+  gone ? s.json({ message: 'Record permanently erased' }) : s.status(404).json({ error: 'Deleted record not found' })
+});
+
+// Erase one section of the bin permanently, e.g. only the deleted buyers
+// (/api/admin/recycle/User?role=buyer) or only the deleted offers.
+app.delete('/api/admin/recycle/:type', auth, admin, async (q, s) => {
+  let Model = recycleModels()[q.params.type];
+  if (!Model) return s.status(400).json({ error: 'Unknown recycle-bin record type' });
+  let filter = { deletedAt: { $ne: null } };
+  if (q.query.role) filter.role = q.query.role;
+  let result = await Model.deleteMany(filter);
+  s.json({ message: 'Section emptied', removed: result.deletedCount })
+});
+
+// Erase the entire bin permanently.
+app.delete('/api/admin/recycle', auth, admin, async (q, s) => {
+  let counts = await Promise.all(Object.values(recycleModels()).map(M => M.deleteMany({ deletedAt: { $ne: null } })));
+  s.json({ message: 'Recycle bin emptied', removed: counts.reduce((total, r) => total + r.deletedCount, 0) })
+});
+
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }) });
 
@@ -209,3 +268,4 @@ async function seedAdmin() {
   await User.findOneAndUpdate({ email }, { $set: { name: 'Administrator', email, password: await bcrypt.hash(process.env.ADMIN_PASSWORD, 12), role: 'admin', approvalStatus: 'approved' } }, { upsert: true, new: true, setDefaultsOnInsert: true })
 }
 mongoose.connect(process.env.MONGODB_URI).then(async () => { await seedAdmin(); app.listen(PORT, () => console.log('AgriLink API running on ' + PORT)) }).catch(e => { console.error('MongoDB connection failed:', e.message); process.exit(1) });
+                  
